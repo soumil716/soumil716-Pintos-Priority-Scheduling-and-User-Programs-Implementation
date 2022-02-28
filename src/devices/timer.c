@@ -24,11 +24,17 @@ static int64_t ticks;
    Initialized by timer_calibrate(). */
 static unsigned loops_per_tick;
 
+/* List of processes in THREAD_BLOCKED state, that is, processes
+   that are currently blocked/ sleeping and not competing for the OS. */
+static struct list blocked_list;
+
 static intr_handler_func timer_interrupt;
 static bool too_many_loops (unsigned loops);
 static void busy_wait (int64_t loops);
 static void real_time_sleep (int64_t num, int32_t denom);
 static void real_time_delay (int64_t num, int32_t denom);
+static bool sleep_time_less (const struct list_elem *, const struct list_elem *, void *);
+
 
 /* Sets up the timer to interrupt TIMER_FREQ times per second,
    and registers the corresponding interrupt. */
@@ -36,6 +42,7 @@ void
 timer_init (void) 
 {
   pit_configure_channel (0, 2, TIMER_FREQ);
+  list_init(&blocked_list);
   intr_register_ext (0x20, timer_interrupt, "8254 Timer");
 }
 
@@ -84,16 +91,33 @@ timer_elapsed (int64_t then)
   return timer_ticks () - then;
 }
 
+static bool
+sleep_time_less (const struct list_elem *a_, const struct list_elem *b_,
+            void *aux UNUSED) 
+{
+  const struct thread *a = list_entry (a_, struct thread, elem);
+  const struct thread *b = list_entry (b_, struct thread, elem);
+  
+  return a->sleep_time < b->sleep_time;
+}
+
 /* Sleeps for approximately TICKS timer ticks.  Interrupts must
    be turned on. */
 void
 timer_sleep (int64_t ticks) 
 {
+  enum intr_level old_level;
   int64_t start = timer_ticks ();
 
   ASSERT (intr_get_level () == INTR_ON);
-  while (timer_elapsed (start) < ticks) 
-    thread_yield ();
+  
+  old_level = intr_disable ();
+  struct thread *t_c = thread_current ();
+  t_c->sleep_time = start + ticks;
+  list_insert_ordered (&blocked_list, &t_c->elem,
+                                sleep_time_less, NULL);
+  thread_block();
+  intr_set_level (old_level);
 }
 
 /* Sleeps for approximately MS milliseconds.  Interrupts must be
@@ -172,10 +196,43 @@ timer_interrupt (struct intr_frame *args UNUSED)
 {
   ticks++;
   thread_tick ();
+  enum intr_level old_level;
+  old_level = intr_disable ();
+  while(!list_empty (&blocked_list))
+    {
+    struct list_elem *first_elem = list_begin(&blocked_list);
+    struct thread *t_f = list_entry (first_elem, struct thread, elem);
+    if(t_f->sleep_time <= ticks)
+    {
+      list_pop_front(&blocked_list);
+      thread_unblock(t_f);
+    } else
+    {
+      break;
+    }
+  }
+  //Soumil's code lines 215-230
+  if (thread_mlfqs)
+  {
+    if (ticks % TIMER_FREQ == 0)
+    {
+      thread_update_load_avg ();
+      thread_update_all_threads_recent_cpu ();
+    }
+    if (ticks % 4 == 0)
+    {
+      thread_update_all_threads_priority_mlfqs ();
+    }
+    if(thread_greater_priority_thread_exist ())
+    {
+      intr_yield_on_return ();
+    } 
+  }
+  intr_set_level (old_level);
 }
 
 /* Returns true if LOOPS iterations waits for more than one timer
-   tick, otherwise false. */
+   tick, otherwise false. */ 
 static bool
 too_many_loops (unsigned loops) 
 {
