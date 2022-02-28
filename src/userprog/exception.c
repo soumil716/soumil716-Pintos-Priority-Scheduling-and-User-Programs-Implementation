@@ -4,6 +4,7 @@
 #include "userprog/gdt.h"
 #include "threads/interrupt.h"
 #include "threads/thread.h"
+#include "userprog/syscall.h"
 
 /* Number of page faults processed. */
 static long long page_fault_cnt;
@@ -84,6 +85,7 @@ kill (struct intr_frame *f)
   switch (f->cs)
     {
     case SEL_UCSEG:
+      syscall_exit(-1);
       /* User's code segment, so it's a user exception, as we
          expected.  Kill the user process.  */
       printf ("%s: dying due to interrupt %#04x (%s).\n",

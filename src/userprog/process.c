@@ -17,10 +17,16 @@
 #include "threads/palloc.h"
 #include "threads/thread.h"
 #include "threads/vaddr.h"
+#include "threads/synch.h"
+#include "userprog/syscall.h"
+#include "devices/timer.h"
 
 static thread_func start_process NO_RETURN;
 static bool load (const char *cmdline, void (**eip) (void), void **esp);
-
+static char *f_name;
+static char **save_ptr2;
+static int exec_count = -1;
+static bool is_load_success = true;
 /* Starts a new thread running a user program loaded from
    FILENAME.  The new thread may be scheduled (and may even exit)
    before process_execute() returns.  Returns the new process's
@@ -28,20 +34,40 @@ static bool load (const char *cmdline, void (**eip) (void), void **esp);
 tid_t
 process_execute (const char *file_name) 
 {
-  char *fn_copy;
+  char *fn_copy, *save_ptr;
   tid_t tid;
 
   /* Make a copy of FILE_NAME.
      Otherwise there's a race between the caller and load(). */
   fn_copy = palloc_get_page (0);
+  f_name = palloc_get_page (0);
   if (fn_copy == NULL)
     return TID_ERROR;
   strlcpy (fn_copy, file_name, PGSIZE);
+  strlcpy (f_name, file_name, PGSIZE);
 
+char *name= strtok_r (f_name, " ", &save_ptr);
+//printf("********************* NAME: %s \n", name);
   /* Create a new thread to execute FILE_NAME. */
-  tid = thread_create (file_name, PRI_DEFAULT, start_process, fn_copy);
+  exec_count +=1;
+  struct child_details* child_detail = NULL;
+  tid = thread_create (name, PRI_DEFAULT, start_process, fn_copy);
   if (tid == TID_ERROR)
-    palloc_free_page (fn_copy); 
+    palloc_free_page (fn_copy);
+  else
+  {
+    child_detail = palloc_get_page (0);
+    child_detail->tid = tid;
+    child_detail->has_exit = false;
+    child_detail->is_parent_waiting = false;
+    list_push_back(&thread_current()->children_list, &child_detail->elem);
+  }    
+  sema_down(&thread_current()->load);
+ if(!is_load_success && child_detail)
+ {
+   list_remove(&child_detail->elem);
+   return -1;
+ }
   return tid;
 }
 
@@ -50,21 +76,28 @@ process_execute (const char *file_name)
 static void
 start_process (void *file_name_)
 {
-  char *file_name = file_name_;
+  char *save_ptr;
+  char *file_name = strtok_r (file_name_, " ", &save_ptr);
   struct intr_frame if_;
   bool success;
+  save_ptr2 = &save_ptr;
+
+//printf(" SAVE PTR:  %s", &save_ptr);
 
   /* Initialize interrupt frame and load executable. */
   memset (&if_, 0, sizeof if_);
   if_.gs = if_.fs = if_.es = if_.ds = if_.ss = SEL_UDSEG;
   if_.cs = SEL_UCSEG;
   if_.eflags = FLAG_IF | FLAG_MBS;
-  success = load (file_name, &if_.eip, &if_.esp);
-
+  success = load (file_name, &if_.eip, &if_.esp );
+  if(exec_count)
+    is_load_success = success;
   /* If load failed, quit. */
+  sema_up(&thread_current()->parent->load);
   palloc_free_page (file_name);
-  if (!success) 
+  if (!success)
     thread_exit ();
+  //sema_up(&thread_current()->parent->load);
 
   /* Start the user process by simulating a return from an
      interrupt, implemented by intr_exit (in
@@ -88,7 +121,25 @@ start_process (void *file_name_)
 int
 process_wait (tid_t child_tid UNUSED) 
 {
-  return -1;
+  int status = -1;
+  if(list_empty(&thread_current()->children_list))
+    return status;
+  struct child_details *child_detail = process_get_child_by_tid(thread_current(), child_tid);
+  if(child_detail == NULL || child_detail->is_parent_waiting)
+     return status;
+  if(child_detail->has_exit)
+  {
+    status = child_detail->exit_status;
+    list_remove(&child_detail->elem);
+    palloc_free_page(child_detail);
+    return status;
+  }
+  child_detail->is_parent_waiting = true;
+  sema_down(&thread_current()->wait);
+  status = child_detail->exit_status;
+  list_remove(&child_detail->elem);
+  palloc_free_page(child_detail);
+  return status;
 }
 
 /* Free the current process's resources. */
@@ -98,6 +149,16 @@ process_exit (void)
   struct thread *cur = thread_current ();
   uint32_t *pd;
 
+  while(!list_empty(&cur->children_list))
+  {
+    struct list_elem *e = list_pop_front(&cur->children_list);
+    struct child_details *child_detail = list_entry (e, struct child_details, elem);
+    palloc_free_page(child_detail);
+  }
+  if(cur->exe_file)
+  {
+    file_close(cur->exe_file);
+  }
   /* Destroy the current process's page directory and switch back
      to the kernel-only page directory. */
   pd = cur->pagedir;
@@ -195,7 +256,7 @@ struct Elf32_Phdr
 #define PF_W 2          /* Writable. */
 #define PF_R 4          /* Readable. */
 
-static bool setup_stack (void **esp);
+static bool setup_stack (void **esp, char *file_name);
 static bool validate_segment (const struct Elf32_Phdr *, struct file *);
 static bool load_segment (struct file *file, off_t ofs, uint8_t *upage,
                           uint32_t read_bytes, uint32_t zero_bytes,
@@ -302,17 +363,19 @@ load (const char *file_name, void (**eip) (void), void **esp)
     }
 
   /* Set up stack. */
-  if (!setup_stack (esp))
+  if (!setup_stack (esp,(char *)file_name))
     goto done;
 
   /* Start address. */
   *eip = (void (*) (void)) ehdr.e_entry;
 
   success = true;
+  t->exe_file = file;
+  file_deny_write(file);
 
  done:
   /* We arrive here whether the load is successful or not. */
-  file_close (file);
+  //file_close (file);
   return success;
 }
 
@@ -427,11 +490,11 @@ load_segment (struct file *file, off_t ofs, uint8_t *upage,
 /* Create a minimal stack by mapping a zeroed page at the top of
    user virtual memory. */
 static bool
-setup_stack (void **esp) 
+setup_stack (void **esp, char *file_name) 
 {
   uint8_t *kpage;
   bool success = false;
-
+//printf("***************\n");
   kpage = palloc_get_page (PAL_USER | PAL_ZERO);
   if (kpage != NULL) 
     {
@@ -441,6 +504,66 @@ setup_stack (void **esp)
       else
         palloc_free_page (kpage);
     }
+
+  int argc=0, total_len=0, j=0;
+  char *argv[64];
+  int addr[64];
+   char *token;
+   for (token = file_name; token != NULL;
+        token = strtok_r (NULL, " ", save_ptr2))
+     {
+       argv[argc] = token;
+       argc++;
+     }
+//printf("*************** %d \n", argc);
+    for(int i=argc-1; i>=0;i--)
+    {
+      int size = strlen(argv[i]) +1;
+      *esp-=size;
+      total_len+=size;
+      memcpy(*esp, argv[i], size);
+      addr[j] = *(int*)esp;
+      j++;
+//printf("*************** ARGV[%d]: %s with SIZE: %d  \n", i, argv[i],size );
+    }
+//printf("*********** TOTAL LENGTH: %d", total_len);
+    uint8_t padd = 0;
+    while(total_len %4)
+    {
+    *esp-=sizeof(padd);
+    *(uint8_t*)(*esp)=padd;
+    total_len++;
+    }
+//printf("*************** ESP: 0x%x  \n", (unsigned int)*esp);
+    char *sent = (char*)0;
+    *esp-=sizeof(sent);
+    *(char*)(*esp)=(int)sent;
+
+//printf("*************** ESP 2: 0x%x  \n", (unsigned int)*esp);
+
+    for(int i=0; i<j;i++){
+      char *temp_adr = (char*)addr[i];
+      int size = sizeof(temp_adr);
+      *esp-=size;
+      memcpy(*esp, &temp_adr, size);
+    }
+
+//printf("*************** ESP 3: 0x%x  \n", (unsigned int)*esp);
+
+    char **last_adr = *esp;
+    *esp-=sizeof(last_adr);
+    memcpy(*esp, &last_adr, sizeof(last_adr));
+
+//printf("*************** ESP 4: 0x%x  \n", (unsigned int)*esp);
+    *esp-=sizeof(argc);
+    //*(int*)(*esp) = argc;
+memcpy(*esp, &argc, sizeof(last_adr));
+//printf("*************** ESP 5: 0x%x  \n", (unsigned int)*esp);
+    void *fake_ret = 0;
+    *esp-=sizeof(fake_ret);
+     memcpy(*esp, &fake_ret, sizeof(fake_ret));
+//printf("*************** ESP 6: 0x%x  \n", (unsigned int)*esp);
+  //hex_dump(*esp,*esp, 128, true);
   return success;
 }
 
@@ -462,4 +585,19 @@ install_page (void *upage, void *kpage, bool writable)
      address, then map our page there. */
   return (pagedir_get_page (t->pagedir, upage) == NULL
           && pagedir_set_page (t->pagedir, upage, kpage, writable));
+}
+
+struct child_details *
+process_get_child_by_tid(struct thread *th, tid_t child_tid)
+{
+  struct list_elem *e;
+
+  for (e = list_begin (&th->children_list); e != list_end (&th->children_list);
+   e = list_next (e))
+  {
+    struct child_details *child_detail = list_entry (e, struct child_details, elem);
+    if(child_detail->tid == child_tid)
+        return child_detail;
+  }
+  return NULL;
 }

@@ -8,9 +8,9 @@
 
 >> Fill in the names and email addresses of your group members.
 
-FirstName LastName <email@domain.example>
-FirstName LastName <email@domain.example>
-FirstName LastName <email@domain.example>
+Harman Singh <harmansi@buffalo.edu>
+Sakshi Mehra <sakshime@buffalo.edu>
+Soumil Ghosh <soumilgh@buffalo.edu>
 
 ---- PRELIMINARIES ----
 
@@ -30,22 +30,94 @@ FirstName LastName <email@domain.example>
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
 
+In src\userprog\process.c :
+
+static char *f_name;		/* Copy of the file name*/
+static char **save_ptr2;	/*address of the tokenizer of command arguments
+				after separating file name*/
+
 ---- ALGORITHMS ----
 
 >> A2: Briefly describe how you implemented argument parsing.  How do
 >> you arrange for the elements of argv[] to be in the right order?
 >> How do you avoid overflowing the stack page?
 
+In start_process(),
+we call char *file_name = strtok_r (file_name_, " ", &save_ptr).
+Then we set the global variable save_ptr2 = &save_ptr. 
+Now file_detail ponts to the name of the file and *save_ptr2 points to
+the address of the command arguments.
+
+We have also added a new argument in setup_stack() to accept file_name_
+When load() calls setup stack, it also passes the file_name_ which now
+contains the command arguements since file name has been taken out.
+In setup_stack(),
+we have added the following local variables.
+
+ int argc=0, total_len=0, j=0;
+ char *argv[64];
+ int addr[64];
+ char *token, *save_ptr;
+
+ we iterate through the passed file_name using for loop and strtok_r() with save_ptr2.
+
+   for (token = file_name; token != NULL;
+        token = strtok_r (NULL, " ", save_ptr2))
+     {
+       argv[argc] = token;
+       argc++;
+     }
+
+Then we iterate through argv in reverse order.So, the first token is the
+last argument and the last token is the first argument. 
+This is to arrange for the elements of argv[] in the right order.
+In each iteration,
+we get the size of argv[i], subtract it from *esp and copy it using memcpy()
+as shown below.
+
+    for(int i=argc-1; i>=0;i--)
+    {
+      int size = strlen(argv[i]) +1;
+      *esp-=size;
+      total_len+=size;
+      memcpy(*esp, argv[i], size);
+      addr[j] = *esp;
+      j++;
+    }
+
+We use total_len to add the required padding as follows:
+    uint8_t padd = 0;
+    while(total_len %4)
+    {
+    *esp-=sizeof(padd);
+    *(uint8_t*)(*esp)=padd;
+    total_len++;
+    }
+
+We follow the same approach to push a null pointer sentinel,
+addresses of the argument strings(stored in array 'addr'),
+address of argv[0], argc and fake return address.
+
+To avoid overflowing, we are only allowing upto 64 arguments.
+
 ---- RATIONALE ----
 
 >> A3: Why does Pintos implement strtok_r() but not strtok()?
+
+Pintos implement strtok_r() but not strtok() because strtok uses global data,
+so it is unsafe in threaded programs such as kernels.
 
 >> A4: In Pintos, the kernel separates commands into a executable name
 >> and arguments.  In Unix-like systems, the shell does this
 >> separation.  Identify at least two advantages of the Unix approach.
 
+1. Complexity is reduced in the kernel as it no longer needs to validate the
+commands and arguments because the shell can take care of that.
+2. Kernel can focus more on handling the primary functionality and no longer 
+need to worry about error-handling in case of bad pointers. 
+
 			     SYSTEM CALLS
-			     ============
+			     ============           
 
 ---- DATA STRUCTURES ----
 
@@ -53,14 +125,120 @@ FirstName LastName <email@domain.example>
 >> `struct' member, global or static variable, `typedef', or
 >> enumeration.  Identify the purpose of each in 25 words or less.
 
+In src\threads\thread.h:
+
+In struct thread
+  {
+	#ifdef USERPROG
+    struct list children_list;            /* List of thread's Children. */ 
+    struct thread* parent;                /* Parent Thread. */
+    struct semaphore wait;                /* Up'd by Child after completion. */
+    struct semaphore load;                /* Up'd by Child after loading. */
+    struct file *exe_file;                /* Thread's executable. */
+	#endif
+  }
+
+In src\userprog\process.h:
+
+  /* Child details. */
+struct child_details 
+{
+  tid_t tid;                   /* Thread identifier. */
+  int exit_status;             /* Thread exit status. */
+  bool is_parent_waiting;      /* Flag to denote if parent is waiting on child. */
+  bool has_exit;               /* Flag to denote if thread has exit. */
+  struct list_elem elem;       /* List element. */
+};
+
+In src\userprog\process.c:
+
+static int exec_count = -1;	       /* total Process count */
+static bool is_load_success = true;    /* Flag to ensure correct load success/failure
+                                     	status is passed back to the thread that
+					calls "exec" */
+
+In src\userprog\syscall.h:
+
+/* File details. */
+struct file_details 
+  {
+    int fd;                         /* fd. */
+    struct file *file_ptr ;         /*file pointer. */
+    struct list_elem elem;          /* List element. */
+    int tid;                        /* Thread identifier. */
+  };
+
+In src\userprog\syscall.c:
+
+static int fd_count = 2;           /* To assign unique values to file descriptors
+                                      of open files by incrementing it each time. */
+
+struct list files_list;             /* List of opened files. */
+
+static struct lock lock;	   /* Lock to ensure synchronization among
+				      file system calls. */
+
+
 >> B2: Describe how file descriptors are associated with open files.
 >> Are file descriptors unique within the entire OS or just within a
 >> single process?
+
+There is a static variable fd_count which is initialized to 2.
+Each time a new file is opened,
+fd_count is incremented and file's FD is set to fd_count i.e.
+
+  struct file_details* file_detail = palloc_get_page (0);
+  file_detail->fd = ++fd_count;
+  file_detail->file_ptr = opened_file;
+  file_detail->tid = thread_current ()->tid;
+  list_push_back (&files_list, &file_detail->elem);
+
+The file descriptors are unique within the entire OS.
 
 ---- ALGORITHMS ----
 
 >> B3: Describe your code for reading and writing user data from the
 >> kernel.
+
+
+READ:
+
+1. The buffer is validated. Exit with -1 if invalid otherwise go to next step.
+
+2. If the fd == STDIN_FILENO then iteratively retrieve the keys from the
+   input buffer using input_getc() inside a for loop upto size(3rd arg),
+   put the keys in the buffer and return the number of keys read.
+
+3. Get the file_detail from files_list using custom get_file_from_list(int fd). 
+   If file_detail == NULL i.e. file is not present in the files_list
+   then return -1, else go to next step.
+
+4. Acquire the lock and call file_read() function from file.h
+   Store it's returned value in a variable (bytes_read is the var name used).
+
+5. Release the lock.
+
+6. Return bytes_read.
+
+WRITE:
+
+1. The buffer is validated. Exit with -1 if invalid otherwise go to next step.
+
+2. If the fd == STDIN_FILENO then Exit with -1, otherwise go to next step.
+
+3. If the fd == STDOUT_FILENO then call putbuf() to write the size(3rd arg)
+   characters in BUFFER to the console and return total characters written.
+
+4. Get the file_detail using custom get_file_from_list(int fd).
+   If file_detail == NULL i.e. file is not present in the files_list
+   then return -1, else go to next step.
+
+5. Acquire the lock and call file_write() function from file.h and store
+   it's returned value in a variable(bytes_read is the variable name used).
+
+6. Release the lock.
+
+7. Return bytes_read.
 
 >> B4: Suppose a system call causes a full page (4,096 bytes) of data
 >> to be copied from user space into the kernel.  What is the least
@@ -69,8 +247,51 @@ FirstName LastName <email@domain.example>
 >> for a system call that only copies 2 bytes of data?  Is there room
 >> for improvement in these numbers, and how much?
 
+case: full page (4,096 bytes) of data
+least: 1
+Greatest: 4,096
+
+case: 2 bytes of data
+least: 1
+Greatest: 2
+
+We don't think there's any room for improvement.
+
 >> B5: Briefly describe your implementation of the "wait" system call
 >> and how it interacts with process termination.
+
+1. The "wait" system call returns the result of process_wait().
+
+2. In process_wait():
+	a. If the thread's children_list is empty then return -1.
+
+	b. Get child_detail from the current thread's children_list
+           by calling custom fn process_get_child_by_tid().
+
+	c. if (child_detail == NULL) return -1.
+
+	d. if (child_detail->is_parent_waiting == true) i.e. the thread is already
+           waiting on that child then return -1.
+
+	e. if (child_detail->has_exit == true) i.e. the child has already exited. 
+	   Set status = child_detail->exit_status,
+	   remove child_detail from the current thread's children_list,
+	   free up child_detail's memory and return the status.
+
+	f. set child_detail->is_parent_waiting = true.
+
+	g. call sema_down(&thread_current()->wait) and wait for the child to up the
+           semaphore before it exits.
+
+	h. After the child ups the wait sema, parent resumes and
+           set status = child_detail->exit_status,
+	   remove child_detail from the current thread's children_list,
+	   free up child_detail's memory and return the status.
+
+As mentioned in process_wait() description above, the wait system call interacts
+with process termination using a semaphore named 'wait'. The 'wait' semaphore 
+is down'd when process_wait() is called on a child and is up'd by the child
+during termination.
 
 >> B6: Any access to user program memory at a user-specified address
 >> can fail due to a bad pointer value.  Such accesses must cause the
@@ -86,6 +307,32 @@ FirstName LastName <email@domain.example>
 >> paragraphs, describe the strategy or strategies you adopted for
 >> managing these issues.  Give an example.
 
+We implemented safe memory access using the first approach i.e.
+by validating the pointer before dereferencing it.
+Before dereferencing a pointer, we check:
+	1. Is its address above or at PHYS_BASE?
+	2. Is it a NULL pointer?
+	3. Is its memory unmapped (using pagedir_get_page())? 
+
+If any of the condition is true then we exit with -1 status.
+
+If the system call uses buffer then we also validate the buffer using the
+same 3 checks mentioned above.
+
+Example: In case of "write" system call, we first validate the pointer
+to call number.
+Then, we validate the call's three arguments.
+After that, we validate the buffer to ensure safe memory access.
+If any of them is invalid then we exit with -1 status.
+
+To ensure that all temporarily allocated resources (locks, buffers, etc.) 
+are freed when an error is detected, we call exit system call which frees up
+the resourses held by the process and terminates it.
+
+Note: In case a page fault happens even after the checks above,
+we are calling exit system call in src\userprog\exception.c to free up
+the resoures and terminate the process.
+
 ---- SYNCHRONIZATION ----
 
 >> B7: The "exec" system call returns -1 if loading the new executable
@@ -93,6 +340,39 @@ FirstName LastName <email@domain.example>
 >> loading.  How does your code ensure this?  How is the load
 >> success/failure status passed back to the thread that calls "exec"?
 
+In src\threads\thread.h: 
+We have added semaphore named 'load' in struct thread 
+to handle synchronization when loading a new executable.
+
+In struct thread
+  {
+    struct semaphore load;                /* Up'd by Child after loading. */
+  }
+
+  The semaphore load is down'd in process_execute()
+  using sema_down(&thread_current()->load) after calling thread_create(). 
+  It is up'd by the child process in process_start() after load() executes,
+  using the parent reference i.e. the child ups the parents's sema load by
+  calling sema_up(&thread_current()->parent->load).
+
+
+  The load success/failure status is passed back to the thread
+  that calls "exec" using a static bool variable named 'is_load_success' i.e.
+  static bool is_load_success = true. 
+
+In src\userprog\process.c:
+  static bool is_load_success = true; /* Flag to ensure correct load 
+					success/failure status is passed 
+				        back to the thread that calls "exec" */
+
+  In process_start(), is_load_success is updated with the return value of load() 
+  beforing calling sema_up(&thread_current()->parent->load).
+  Then parent resumes process_execute () and checks if is_load_success
+  is true or false.
+  If is_load_success is false, this indicates that new executable's load() failed
+  and process_execute() returns -1.
+
+  
 >> B8: Consider parent process P with child process C.  How do you
 >> ensure proper synchronization and avoid race conditions when P
 >> calls wait(C) before C exits?  After C exits?  How do you ensure
@@ -100,16 +380,135 @@ FirstName LastName <email@domain.example>
 >> terminates without waiting, before C exits?  After C exits?  Are
 >> there any special cases?
 
+In src\threads\thread.h: 
+We have added semaphore named 'wait' in struct thread 
+to handle wait system call.
+
+In struct thread
+  {
+    struct semaphore wait;                /* Up'd by Child after completion. */
+    struct list children_list;            /* List of thread's Children. */ 
+  }
+
+/* Child details. */
+struct child_details 
+{
+  tid_t tid;                      /* Thread identifier. */
+  int exit_status;                /* Thread exit status. */
+  bool is_parent_waiting;         /* Flag to denote if parent is waiting on child. */
+  bool has_exit;                  /* Flag to denote if thread has exit. */
+  struct list_elem elem;          /* List element. */
+};
+
+Each thread also has a list of all its children called children_list.
+For each child, a new entry of type child_details is inserted
+in the children_list.
+When a child terminates, it updates the corresponding list entry
+with it's exit_status and sets has_exit to true.
+
+	Case: when P calls wait(C) before C exits.
+
+		a. Check if C is present in P's children_list.
+		   If not, then return -1.
+
+		b. Get C's corresponding list entry (child_detail)
+		   from P's children_list.
+
+		c. if child_detail ==  NULL, return -1
+
+		d. if child_detail->is_parent_waiting == TRUE
+		   then return -1.
+
+		e. check if C has already exit using the 'has_exit' attribute
+                   in child_detail which is set to true by a process before
+                   it terminates. If true, then return child_detail->exit.
+
+		f. P's wait semaphore is down'd i.e.
+		   sema_down(&thread_current()->wait).
+
+                g. P's waits till it's wait sema is Up'd by C before it
+		   terminates. C also updated it's corresponding 
+                   child_detail->exit_status and child_detail->has_exit
+                   in P's children_list.
+
+		h. P resumes and gets the exit status of C i.e
+		   set status = child_detail->exit_status.
+
+		i. P removes C's child_detail entry from it's
+                   children_list and frees up its memory.
+
+		g. return status
+
+	Case: when P calls wait(C) after C exits.
+
+		a. Check if C is present in P's children_list.
+		   If not, then return -1.
+
+	        b. Get C's corresponding list entry (child_detail)
+                   from P's children_list.
+
+		c. if child_detail ==  NULL, return -1
+
+		d. Check if P is already waiting on C.
+		   If true, then return -1.
+
+		e. check if C has already exit using the 'has_exit' attribute
+                   in child_detail which is set to true by a process before
+                   it terminates. If true, then return child_detail->exit.
+
+To free up the resources:
+
+	a. In exit system call, we check if the terminating process' parent has
+	   any elements in it's children_list.
+	If yes, then we get corresponding list entry (child_detail) of the
+        terminating process from its's parent's children_list and update 
+        child_detail->exit_status and child_detail->has_exit. 
+
+	b. Call close_all_fds() which closes all the files opened by the process.
+           It then removes their entries from the files_list and free up 
+           their memory.
+
+	c. If the children_list of the terminating process is not empty then
+           each list entry is popped up and it's memory is deallocated.
+
+	d. Close the executable file of the process.
+
+	Case: when P terminates without waiting, before C exits
+	All the steps given above are executed which ensures that all resources
+        are freed.
+
+	Case: After C exits
+	All the steps given above are executed which ensures that all resources
+        are freed.
+
+	All the cases have been covered.
+
 ---- RATIONALE ----
 
 >> B9: Why did you choose to implement access to user memory from the
 >> kernel in the way that you did?
 
+We implemented safe memory access using the first approach i.e. by validating
+the pointer before dereferencing it.
+We chose this approach because it is simple and straightforward.
+
 >> B10: What advantages or disadvantages can you see to your design
 >> for file descriptors?
 
+Advantages:
+1. Safe memory access approach used is simple and straightforward.
+2. There is only one files_list which keeps track of all the files
+opened in the OS. This adds more simplicity instead of having a 
+seperate list of files of each process.
+
+Disadvantages:
+We are using the first approach for safe memory access which
+is less effecient compared to the second approach.
+
 >> B11: The default tid_t to pid_t mapping is the identity mapping.
 >> If you changed it, what advantages are there to your approach?
+
+We did not change it.
 
 			   SURVEY QUESTIONS
 			   ================
