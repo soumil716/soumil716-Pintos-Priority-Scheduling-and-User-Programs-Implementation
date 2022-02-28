@@ -4,6 +4,7 @@
 #include <debug.h>
 #include <list.h>
 #include <stdint.h>
+#include "threads/fixedpoint.h"
 
 /* States in a thread's life cycle. */
 enum thread_status
@@ -89,6 +90,14 @@ struct thread
     uint8_t *stack;                     /* Saved stack pointer. */
     int priority;                       /* Priority. */
     struct list_elem allelem;           /* List element for all threads list. */
+    //Soumil's code lines 94-96
+    int64_t sleep_time;                 /*Thread's sleep time. */
+    int nice;                           /* Nice. */
+    fixed_point_t recent_cpu;           /* CPU time the thread has received recently. */
+    int total_donations_accepted;       /* Total Number of donation accepted */
+    struct lock *lock_to_acquire;       /* Lock for which the thread is waiting */
+    int priority_list[9];               /* Donation Priority List */  
+    int priority_list_size;             /* Size of donation priority list */
 
     /* Shared between thread.c and synch.c. */
     struct list_elem elem;              /* List element. */
@@ -132,10 +141,19 @@ void thread_foreach (thread_action_func *, void *);
 
 int thread_get_priority (void);
 void thread_set_priority (int);
+int get_payable_donation(struct thread *cur,int elem);
+void thread_donate_priority(void);
+bool thread_priority_great (const struct list_elem *, const struct list_elem *, void *);
+//Soumil's code lines 148-149
+void thread_update_all_threads_priority_mlfqs (void);
+bool thread_greater_priority_thread_exist (void);
 
 int thread_get_nice (void);
 void thread_set_nice (int);
+//Soumil's code lines 154 and 157
 int thread_get_recent_cpu (void);
+void thread_update_all_threads_recent_cpu (void);
 int thread_get_load_avg (void);
+void thread_update_load_avg (void);
 
 #endif /* threads/thread.h */
